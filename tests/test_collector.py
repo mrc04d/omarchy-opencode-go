@@ -242,8 +242,10 @@ class LimitsHttpTest(unittest.TestCase):
         self.assertTrue(result["transport"])
 
     def test_truncated_body_is_transport_failure(self):
-        headers = {"Content-Type": "application/json", "Content-Length": "1000"}
-        with StubServer(200, b"{}", headers=headers) as srv:
+        body = ok_body()
+        truncated = body[:len(body) // 2]  # valid usage JSON cut short
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+        with StubServer(200, truncated, headers=headers) as srv:
             os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
             result = self.mod.probe_limits("sk-x")
         self.assertTrue(result["transport"])
@@ -459,6 +461,37 @@ class LocalStatsTest(unittest.TestCase):
         cache = next(pathlib.Path(self.tmp.name).rglob("opencode-go-opencode-*.json"))
         cache.write_text("[]")
         stats = self.mod.scan_local_stats(0)  # re-scans instead of crashing
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["totalPrompts"], 1)
+
+    def _poisoned_cache(self, mutate):
+        self.mod.scan_local_stats(0)
+        cache = next(pathlib.Path(self.tmp.name).rglob("opencode-go-opencode-*.json"))
+        payload = json.loads(cache.read_text())
+        payload["stats"]["totalPrompts"] = 999  # trusted cache would surface this
+        mutate(payload["stats"])
+        cache.write_text(json.dumps(payload))
+        return cache
+
+    def test_malformed_recent_days_entry_is_ignored(self):
+        self._poisoned_cache(lambda stats: stats.update(
+            {"recentDays": [{"date": 1, "messageCount": 0}]}))
+        stats = self.mod.scan_local_stats(900)
+        self.assertEqual(stats["totalPrompts"], 1)  # re-scanned, not trusted
+
+    def test_malformed_active_dates_entry_is_ignored(self):
+        self._poisoned_cache(lambda stats: stats.update({"activeDates": ["2026-09-10", 5]}))
+        stats = self.mod.scan_local_stats(900)
+        self.assertEqual(stats["totalPrompts"], 1)
+
+    def test_unwritable_cache_still_returns_stats(self):
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        ro = pathlib.Path(self.tmp.name) / "readonly"
+        ro.mkdir()
+        os.chmod(ro, 0o500)
+        os.environ["XDG_CACHE_HOME"] = str(ro / "cache")
+        stats = self.mod.scan_local_stats(0)
         self.assertIsNotNone(stats)
         self.assertEqual(stats["totalPrompts"], 1)
 

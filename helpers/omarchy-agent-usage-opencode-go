@@ -332,9 +332,16 @@ def _valid_cached_stats(cache: Any) -> Optional[dict]:
                 "totalPrompts", "totalSessions", "activeDays"):
         if type(stats.get(key)) is not int:
             return None
-    if not isinstance(stats.get("recentDays"), list):
+    recent = stats.get("recentDays")
+    if not isinstance(recent, list):
         return None
-    if not isinstance(stats.get("activeDates"), list):
+    for entry in recent:
+        if not isinstance(entry, dict) or not isinstance(entry.get("date"), str):
+            return None
+        if type(entry.get("messageCount")) is not int:
+            return None
+    active = stats.get("activeDates")
+    if not isinstance(active, list) or any(not isinstance(entry, str) for entry in active):
         return None
     for mapping_key in ("todayTokensByModel", "modelUsage"):
         mapping = stats.get(mapping_key)
@@ -350,26 +357,31 @@ def _valid_cached_stats(cache: Any) -> Optional[dict]:
 
 
 def scan_local_stats(max_age: int) -> Optional[dict]:
+    # The unresolved path keys the cache; only the resolved path opens the DB.
     try:
-        db = (xdg_data_home() / "opencode" / "opencode.db").expanduser().resolve()
+        db = (xdg_data_home() / "opencode" / "opencode.db").expanduser()
     except (OSError, RuntimeError):
         return None
     if not db.is_file():
         return None
 
-    cache_path = stats_cache_path(db)
-    cached = read_json(cache_path)
-    if not isinstance(cached, dict):
-        cached = None
-    if cached is not None:
-        if type(cached.get("cachedAtMs")) is int and (time.time() * 1000 - cached["cachedAtMs"]) <= max_age * 1000:
-            stats = _valid_cached_stats(cached)
-            if stats is not None:
-                return stats
+    try:
+        cache_path = stats_cache_path(db)
+    except OSError:
+        cache_path = None
+    if cache_path is not None:
+        cached = read_json(cache_path)
+        if not isinstance(cached, dict):
+            cached = None
+        if cached is not None:
+            if type(cached.get("cachedAtMs")) is int and (time.time() * 1000 - cached["cachedAtMs"]) <= max_age * 1000:
+                stats = _valid_cached_stats(cached)
+                if stats is not None:
+                    return stats
 
     try:
-        conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2)
-    except sqlite3.Error:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except (sqlite3.Error, OSError, RuntimeError):
         return None
     try:
         conn.execute("PRAGMA query_only = ON")
@@ -442,7 +454,11 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
             "activeDays": len(active_days),
             "activeDates": sorted(active_days),
         }
-    write_json_private(cache_path, {"cachedAtMs": now_ms(), "stats": stats})
+    if cache_path is not None:
+        try:
+            write_json_private(cache_path, {"cachedAtMs": now_ms(), "stats": stats})
+        except OSError:
+            pass
     return stats
 
 

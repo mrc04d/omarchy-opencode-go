@@ -159,6 +159,11 @@ and monthly (30-day) windows; local token usage is scanned from `opencode.db`.
 It is enabled by default alongside the other providers. To hide it, disable the
 provider:
 
-```json
-"opencode-go": { "enabled": false }
+```bash
+omarchy bar set omarchy.agents providers '{
+  "claude": { "enabled": true },
+  "codex": { "enabled": true },
+  "fireworks": { "enabled": true },
+  "opencode-go": { "enabled": false }
+}' --json
 ```

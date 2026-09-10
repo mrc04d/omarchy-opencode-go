@@ -35,7 +35,7 @@ printf 'RUN:%s\n' "$*" >> "$GO_LOG"
 printf '{"schemaVersion":1,"id":"opencode-go","name":"OpenCode Go","ready":false,"limits":[]}\n'
 EOF
 chmod +x "$PLUGIN/helpers/omarchy-agent-usage-opencode-go"
-restore() { mv "$GO_LOG.real" "$PLUGIN/helpers/omarchy-agent-usage-opencode-go"; rm -rf "$FAKEBIN" "$STOCK_DIR"; }
+restore() { mv "$GO_LOG.real" "$PLUGIN/helpers/omarchy-agent-usage-opencode-go"; rm -rf "$FAKEBIN" "$STOCK_DIR" "${XDG_STATE_HOME:-}"; }
 trap restore EXIT
 
 run_wrapper() {
@@ -72,6 +72,16 @@ check "$(cat "$STOCK_LOG")" "RUN:" "except go: stock runs with no args, go exclu
 check "$(cat "$GO_LOG")" "" "except go: go skipped"
 
 : > "$STOCK_LOG"; : > "$GO_LOG"
+run_wrapper --limits-only opencode-go
+check "$(cat "$STOCK_LOG")" "" "limits-only go-only: no stock run"
+check "$(cat "$GO_LOG")" "RUN:--limits-only" "limits-only forwarded to go collector"
+
+: > "$STOCK_LOG"; : > "$GO_LOG"
+run_wrapper --except codex
+check "$(cat "$STOCK_LOG")" "RUN:--except codex" "except codex forwarded to stock updater"
+check "$(cat "$GO_LOG")" "RUN:" "except codex does not exclude go"
+
+: > "$STOCK_LOG"; : > "$GO_LOG"
 run_wrapper --except claude claude
 check "$(cat "$STOCK_LOG")" "" "requested-then-excluded: no stock run"
 check "$(cat "$GO_LOG")" "" "requested-then-excluded: no go"
@@ -88,7 +98,7 @@ cat > "$PLUGIN/helpers/omarchy-agent-usage-opencode-go" <<'EOF'
 printf 'not json\n'
 EOF
 chmod +x "$PLUGIN/helpers/omarchy-agent-usage-opencode-go"
-run_wrapper opencode-go
+run_wrapper opencode-go 2>/dev/null
 check "$(cat "$USAGE/opencode-go.json")" '{"prior":true}' "invalid output preserves prior record"
 
 # missing --except value is an argument error (non-zero, nothing run)
@@ -98,4 +108,5 @@ check "$rc" "1" "dangling --except exits non-zero"
 check "$(cat "$STOCK_LOG")" "" "dangling --except runs nothing"
 
 rm -f "$STOCK_LOG" "$GO_LOG"
+if (( fail == 0 )); then echo ALL_PASS; else echo FAIL; fi
 exit $fail

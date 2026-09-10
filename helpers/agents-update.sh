@@ -71,7 +71,6 @@ if ! { (( ${#only[@]} > 0 )) && (( ${#stock_only[@]} == 0 )); }; then
   stock_args=("${flags[@]}")
   for agent in "${excluded[@]}"; do
     in_stock "$agent" || continue
-    [[ "$agent" == "opencode-go" ]] && continue
     stock_args+=(--except "$agent")
   done
   if (( ${#only[@]} > 0 )); then
@@ -97,7 +96,10 @@ fi
 
 command -v jq >/dev/null 2>&1 || { echo "agents-update: jq is required but not found" >&2; exit 1; }
 
-install -d -m 700 "$USAGE_DIR"
+if ! install -d -m 700 "$USAGE_DIR"; then
+  echo "agents-update: could not create $USAGE_DIR" >&2
+  exit 1
+fi
 tmp="$(mktemp "$USAGE_DIR/.opencode-go.XXXXXX")" || { echo "agents-update: could not create temp file" >&2; exit 1; }
 trap 'rm -f "$tmp"' EXIT
 

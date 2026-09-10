@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "author": "Omarchy",
   "license": "MIT",
-  "description": "Claude Code, Codex, and Fireworks usage, limits, and pace in a native Omarchy bar panel.",
+  "description": "Claude Code, Codex, Fireworks, and OpenCode Go usage, limits, and pace in a native Omarchy bar panel.",
   "kinds": [
     "bar-widget"
   ],
