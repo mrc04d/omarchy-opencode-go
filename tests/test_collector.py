@@ -295,5 +295,72 @@ class LimitsHttpTest(unittest.TestCase):
             self.assertEqual(self.mod.endpoint_url(), self.mod.REAL_ENDPOINT)
 
 
+class LimitsCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_collector()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._saved_cache = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_CACHE_HOME"] = self.tmp.name
+        self.cache = pathlib.Path(self.tmp.name) / "omarchy" / "agent-usage" / "opencode-go-limits.json"
+
+    def tearDown(self):
+        if self._saved_cache is None:
+            os.environ.pop("XDG_CACHE_HOME", None)
+        else:
+            os.environ["XDG_CACHE_HOME"] = self._saved_cache
+
+    def seed(self, fetched_at_ms, limits):
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        self.cache.write_text(json.dumps({"fetchedAtMs": fetched_at_ms, "limits": limits}))
+
+    def test_success_writes_cache_and_reuses_within_15s(self):
+        with StubServer(200, ok_body()) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            first = self.mod.collect_limits("sk-x", False)
+            self.assertTrue(first["limits"])
+            self.assertTrue(self.cache.exists())
+            before = len(srv.requests)
+            second = self.mod.collect_limits("sk-x", False)  # cached; no new request
+        self.assertEqual(len(srv.requests), before)
+        self.assertTrue(second["limits"])
+
+    def test_force_bypasses_reuse_and_failed_force_keeps_cache(self):
+        self.seed(self.mod.now_ms(), [{"label": "Session (5-hour)", "percent": 0.1, "resetsAt": ""}])
+        with StubServer(500, b"{}") as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.collect_limits("sk-x", True)
+        self.assertTrue(result["retry"])
+        self.assertTrue(result["limits"])  # fallback retained
+        cached = json.loads(self.cache.read_text())
+        self.assertNotEqual(cached["limits"], [])
+
+    def test_stale_fallback_over_24h_discarded(self):
+        self.seed(self.mod.now_ms() - (25 * 3600 * 1000),
+                  [{"label": "Session (5-hour)", "percent": 0.1, "resetsAt": ""}])
+        with StubServer(500, b"{}") as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.collect_limits("sk-x", True)
+        self.assertEqual(result["limits"], [])
+        self.assertTrue(result["retry"])
+
+    def test_expired_resets_are_dropped(self):
+        self.seed(self.mod.now_ms(),
+                  [{"label": "Session (5-hour)", "percent": 0.1, "resetsAt": "2000-01-01T00:00:00Z"},
+                   {"label": "Weekly (7-day)", "percent": 0.2, "resetsAt": "2999-01-01T00:00:00Z"}])
+        with StubServer(500, b"{}") as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.collect_limits("sk-x", True)
+        self.assertEqual([w["label"] for w in result["limits"]], ["Weekly (7-day)"])
+
+    def test_401_does_not_use_fallback(self):
+        self.seed(self.mod.now_ms(), [{"label": "Session (5-hour)", "percent": 0.1, "resetsAt": ""}])
+        with StubServer(401, b"{}") as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.collect_limits("sk-x", True)
+        self.assertEqual(result["limits"], [])
+        self.assertFalse(result["retry"])
+
+
 if __name__ == "__main__":
     unittest.main()

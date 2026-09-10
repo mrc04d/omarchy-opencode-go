@@ -218,9 +218,78 @@ def probe_limits(key: str) -> dict:
     return {"ok": True, "limits": limits, "state": "", "transport": False}
 
 
+def limits_cache_path() -> Path:
+    return cache_root() / f"{AGENT_ID}-limits.json"
+
+
+def _parse_iso_utc(value: Any) -> Optional[dt.datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def _valid_cached_limits(cache: Any) -> list:
+    if not isinstance(cache, dict):
+        return []
+    limits = cache.get("limits")
+    if not isinstance(limits, list) or type(cache.get("fetchedAtMs")) is not int:
+        return []
+    clean = []
+    for entry in limits:
+        if not isinstance(entry, dict):
+            return []
+        percent = entry.get("percent")
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+            return []
+        if not (0.0 <= float(percent) <= 1.0):
+            return []
+        clean.append({
+            "label": str(entry.get("label") or "Limit"),
+            "percent": float(percent),
+            "resetsAt": entry.get("resetsAt") if isinstance(entry.get("resetsAt"), str) else "",
+        })
+    return clean
+
+
+def usable_fallback(cache: Any, now: dt.datetime) -> list:
+    limits = _valid_cached_limits(cache)
+    if not limits:
+        return []
+    age_ms = now_ms() - cache["fetchedAtMs"]
+    if age_ms > MAX_FALLBACK_AGE_SECONDS * 1000:
+        return []
+    alive = []
+    for entry in limits:
+        reset = _parse_iso_utc(entry.get("resetsAt"))
+        if reset is None or reset > now:
+            alive.append(entry)
+    return alive
+
+
 def collect_limits(key: str, force: bool) -> dict:
+    path = limits_cache_path()
+    cache = read_json(path)
+    fallback = usable_fallback(cache, dt.datetime.now(dt.timezone.utc))
+
+    if fallback and not force:
+        fetched_at = cache.get("fetchedAtMs", 0) / 1000.0
+        if time.time() - fetched_at < PROBE_MIN_INTERVAL_SECONDS:
+            return {"limits": fallback, "state": "", "retry": False}
+
     probe = probe_limits(key)
-    return {"limits": probe["limits"], "state": probe["state"], "retry": bool(probe["transport"])}
+    if probe["ok"]:
+        write_json_private(path, {"fetchedAtMs": now_ms(), "limits": probe["limits"]})
+        return {"limits": probe["limits"], "state": "", "retry": False}
+
+    if probe["transport"]:
+        return {"limits": fallback, "state": probe["state"], "retry": True}
+    return {"limits": [], "state": probe["state"], "retry": False}
 
 
 def empty_stats() -> dict:
