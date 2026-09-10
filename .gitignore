@@ -1,3 +1,11 @@
+# Editor / OS noise
 *.bak.*
-.gitignore
+*.swp
+*~
+
+# Python
 __pycache__/
+*.pyc
+
+# Test scratch
+/tmp-test-*

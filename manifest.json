@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "matt.agents",
-  "name": "My Agents",
-  "version": "1.1.0",
-  "author": "Omarchy",
+  "id": "io.github.mrc04d.opencode-go",
+  "name": "OpenCode Go Usage",
+  "version": "1.0.0",
+  "author": "Matt",
   "license": "MIT",
-  "description": "Claude Code, Codex, Fireworks, and OpenCode Go usage, limits, and pace in a native Omarchy bar panel.",
+  "description": "Adds an OpenCode Go usage tab to the Omarchy agents bar panel: 5-hour, weekly, and monthly limits with resets, plus local token stats.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,14 +14,16 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "My Agents",
-    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription. Includes OpenCode Go.",
+    "displayName": "OpenCode Go",
+    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription, including OpenCode Go.",
     "category": "AI",
     "aliases": [
       "agents",
-      "model-usage"
+      "model-usage",
+      "opencode-go"
     ],
     "allowMultiple": false,
+    "defaultSection": "right",
     "defaults": {
       "providers": {
         "claude": {
@@ -86,8 +88,5 @@
         "description": "Optional stable device name used inside synced aggregate snapshots."
       }
     ]
-  },
-  "omarchy": {
-    "clonedFrom": "omarchy.agents"
   }
 }

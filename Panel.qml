@@ -7,8 +7,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "omarchy.agents"
-  ipcTarget: "omarchy.agents"
+  moduleName: "io.github.mrc04d.opencode-go"
+  ipcTarget: "io.github.mrc04d.opencode-go"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground

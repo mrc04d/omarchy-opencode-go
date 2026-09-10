@@ -2,7 +2,7 @@
 # Integration tests for agents-update.sh using stub stock updater + stub collector.
 set -uo pipefail
 
-PLUGIN="$HOME/.config/omarchy/plugins/matt.agents"
+PLUGIN="$HOME/.config/omarchy/plugins/io.github.mrc04d.opencode-go"
 WRAPPER="$PLUGIN/helpers/agents-update.sh"
 STOCK_LOG="$(mktemp)"
 GO_LOG="$(mktemp)"
