@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import sqlite3
@@ -198,10 +199,11 @@ def probe_limits(key: str) -> dict:
                 break
             total += len(chunk)
             if total > BODY_LIMIT:
-                response.close()
                 return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
             chunks.append(chunk)
         raw = b"".join(chunks)
+    except (OSError, http.client.HTTPException):
+        return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
     finally:
         response.close()
 

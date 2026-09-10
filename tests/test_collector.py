@@ -103,16 +103,18 @@ class RecordTest(unittest.TestCase):
 
 import http.server
 import threading
+import time
 
 
 class StubServer:
     """One-shot loopback HTTP server with a configurable response."""
 
-    def __init__(self, status=200, body=b"{}", headers=None, chunks=None):
+    def __init__(self, status=200, body=b"{}", headers=None, chunks=None, delay=0.0):
         self.status = status
         self.body = body
         self.headers = headers or {"Content-Type": "application/json"}
         self.chunks = chunks  # list[bytes] streamed instead of body
+        self.delay = delay  # seconds to stall after headers before the body
         self.requests = []
         outer = self
 
@@ -123,6 +125,8 @@ class StubServer:
                 for k, v in outer.headers.items():
                     self.send_header(k, v)
                 self.end_headers()
+                if outer.delay:
+                    time.sleep(outer.delay)
                 try:
                     if outer.chunks is not None:
                         for chunk in outer.chunks:
@@ -183,7 +187,20 @@ class LimitsHttpTest(unittest.TestCase):
         body = json.dumps({"usage": {
             "rolling": {"status": "ok", "percent": -1, "resetsAt": ""},
             "weekly": {"status": "ok", "percent": 150, "resetsAt": ""},
-            "monthly": {"status": "ok", "percent": "34", "resetsAt": ""}}}).encode()
+            "monthly": {"status": "ok", "percent": 34, "resetsAt": ""}}}).encode()
+        with StubServer(200, body) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["transport"])
+        self.assertEqual([w["label"] for w in result["limits"]], ["Monthly (30-day)"])
+        self.assertEqual(round(result["limits"][0]["percent"], 4), 0.34)
+
+    def test_all_invalid_percents_is_transport_failure(self):
+        body = json.dumps({"usage": {
+            "rolling": {"status": "ok", "percent": -1, "resetsAt": ""},
+            "weekly": {"status": "ok", "percent": "34", "resetsAt": ""},
+            "monthly": {"status": "ok", "percent": 101, "resetsAt": ""}}}).encode()
         with StubServer(200, body) as srv:
             os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
             result = self.mod.probe_limits("sk-x")
@@ -212,11 +229,45 @@ class LimitsHttpTest(unittest.TestCase):
         self.assertTrue(result["transport"])
 
     def test_oversized_body_rejected(self):
-        big = b"x" * (65536 + 100)
-        with StubServer(200, big) as srv:
+        body = json.dumps({"usage": {
+            "rolling": {"status": "ok", "percent": 6, "resetsAt": ""},
+            "weekly": {"status": "ok", "percent": 23, "resetsAt": ""},
+            "monthly": {"status": "ok", "percent": 34, "resetsAt": ""},
+            "_pad": "x" * (65536 + 100)}}).encode()
+        self.assertGreater(len(body), 65536)
+        with StubServer(200, body) as srv:
             os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
             result = self.mod.probe_limits("sk-x")
         self.assertTrue(result["transport"])
+
+    def test_truncated_body_is_transport_failure(self):
+        headers = {"Content-Type": "application/json", "Content-Length": "1000"}
+        with StubServer(200, b"{}", headers=headers) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_malformed_chunked_body_is_transport_failure(self):
+        headers = {"Content-Type": "application/json", "Transfer-Encoding": "chunked"}
+        with StubServer(200, b"zz\r\n", headers=headers) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_body_stall_timeout_is_transport_failure(self):
+        self.mod.TIMEOUT_SECONDS = 0.05
+        with StubServer(200, b"{}", headers={"Content-Length": "10"}, delay=0.5) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_redirect_not_followed(self):
+        with StubServer(302, b"") as srv:
+            srv.headers["Location"] = srv.url
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+        self.assertEqual(len(srv.requests), 1)
 
     def test_malformed_json_is_transport_failure(self):
         with StubServer(200, b"{ not json") as srv:
