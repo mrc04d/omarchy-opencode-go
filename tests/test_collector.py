@@ -386,5 +386,74 @@ class LimitsCacheTest(unittest.TestCase):
         self.assertFalse(result["retry"])
 
 
+import datetime as _dt
+import sqlite3 as _sqlite3
+import time
+
+
+class LocalStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_collector()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._saved_data = os.environ.get("XDG_DATA_HOME")
+        self._saved_cache = os.environ.get("XDG_CACHE_HOME")
+        os.environ["XDG_DATA_HOME"] = self.tmp.name
+        os.environ["XDG_CACHE_HOME"] = self.tmp.name
+        self.db = pathlib.Path(self.tmp.name) / "opencode" / "opencode.db"
+        self.db.parent.mkdir(parents=True, exist_ok=True)
+        conn = _sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE message (session_id TEXT, data TEXT)")
+        now_ms = round(_dt.datetime.now().timestamp() * 1000)
+        rows = [
+            ("s1", {"role": "assistant", "providerID": "opencode-go", "modelID": "deepseek-flash",
+                    "tokens": {"input": 100, "output": 10, "reasoning": 5,
+                               "cache": {"read": 50, "write": 1}},
+                    "time": {"created": now_ms}}),
+            ("s1", {"role": "user", "providerID": "opencode-go", "modelID": "deepseek-flash",
+                    "tokens": {}, "time": {"created": now_ms}}),
+            ("s2", {"role": "assistant", "providerID": "anthropic", "modelID": "claude",
+                    "tokens": {"input": 999, "output": 999}, "time": {"created": now_ms}}),
+        ]
+        for sid, obj in rows:
+            conn.execute("INSERT INTO message VALUES (?, ?)", (sid, json.dumps(obj)))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        for name, val in (("XDG_DATA_HOME", self._saved_data), ("XDG_CACHE_HOME", self._saved_cache)):
+            if val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = val
+
+    def test_scan_filters_provider_and_totals_tokens(self):
+        stats = self.mod.scan_local_stats(0)
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["totalPrompts"], 1)
+        self.assertEqual(stats["todayPrompts"], 1)
+        self.assertEqual(stats["totalSessions"], 1)
+        self.assertEqual(stats["todayTotalTokens"], 100 + 10 + 5 + 50 + 1)
+        self.assertEqual(stats["modelUsage"]["deepseek-flash"]["inputTokens"], 100)
+
+    def test_missing_db_is_none(self):
+        self.db.unlink()
+        self.assertIsNone(self.mod.scan_local_stats(0))
+
+    def test_cache_reused_within_age(self):
+        self.mod.scan_local_stats(0)
+        cache = next(pathlib.Path(self.tmp.name).rglob("opencode-go-opencode-*.json"))
+        first = cache.read_text()
+        time.sleep(0.01)
+        self.mod.scan_local_stats(900)
+        self.assertEqual(cache.read_text(), first)  # reused, not rewritten
+
+    def test_malformed_cache_is_ignored(self):
+        self.mod.scan_local_stats(0)
+        cache = next(pathlib.Path(self.tmp.name).rglob("opencode-go-opencode-*.json"))
+        cache.write_text("{ not json")
+        self.assertIsNotNone(self.mod.scan_local_stats(0))  # re-scans instead of trusting
+
+
 if __name__ == "__main__":
     unittest.main()

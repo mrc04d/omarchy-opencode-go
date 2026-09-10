@@ -307,8 +307,141 @@ def empty_stats() -> dict:
     }
 
 
+def recent_date_strings() -> list:
+    today = dt.datetime.now().date()
+    return [(today - dt.timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def _bucket() -> dict:
+    return {"inputTokens": 0, "outputTokens": 0,
+            "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}
+
+
+def stats_cache_path(db: Path) -> Path:
+    digest = hashlib.sha1(str(db).encode("utf-8")).hexdigest()[:16]
+    return cache_root() / f"{AGENT_ID}-opencode-{digest}.json"
+
+
+def _valid_cached_stats(cache: Any) -> Optional[dict]:
+    if not isinstance(cache, dict):
+        return None
+    stats = cache.get("stats")
+    if not isinstance(stats, dict):
+        return None
+    for key in ("todayPrompts", "todaySessions", "todayTotalTokens",
+                "totalPrompts", "totalSessions", "activeDays"):
+        if type(stats.get(key)) is not int:
+            return None
+    if not isinstance(stats.get("recentDays"), list):
+        return None
+    if not isinstance(stats.get("activeDates"), list):
+        return None
+    for mapping_key in ("todayTokensByModel", "modelUsage"):
+        mapping = stats.get(mapping_key)
+        if not isinstance(mapping, dict):
+            return None
+        for value in mapping.values():
+            if mapping_key == "todayTokensByModel":
+                if type(value) is not int:
+                    return None
+            elif not isinstance(value, dict) or any(type(v) is not int for v in value.values()):
+                return None
+    return stats
+
+
 def scan_local_stats(max_age: int) -> Optional[dict]:
-    return None
+    try:
+        db = (xdg_data_home() / "opencode" / "opencode.db").expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not db.is_file():
+        return None
+
+    cache_path = stats_cache_path(db)
+    cached = read_json(cache_path)
+    if cached is not None:
+        if type(cached.get("cachedAtMs")) is int and (time.time() * 1000 - cached["cachedAtMs"]) <= max_age * 1000:
+            stats = _valid_cached_stats(cached)
+            if stats is not None:
+                return stats
+
+    try:
+        conn = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA busy_timeout = 2000")
+        rows = list(conn.execute("SELECT session_id, data FROM message"))
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    recent = {day: 0 for day in recent_date_strings()}
+    sessions, active_days, today_sessions = set(), set(), set()
+    model_usage, today_by_model = {}, {}
+    today_prompts = today_tokens = prompts = 0
+
+    for session_id, raw in rows:
+        try:
+            entry = json.loads(raw)
+            if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                continue
+            if str(entry.get("providerID") or "") != AGENT_ID:
+                continue
+            tokens = entry.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            inp = number(tokens.get("input"))
+            out = number(tokens.get("output")) + number(tokens.get("reasoning"))
+            cr = number(cache.get("read"))
+            cw = number(cache.get("write"))
+            total = inp + out + cr + cw
+            if total <= 0:
+                continue
+            created = number((entry.get("time") or {}).get("created"))
+            if created > 0:
+                day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
+            else:
+                day = today
+            model = str(entry.get("modelID") or "opencode-go").rstrip("/").split("/")[-1]
+        except Exception:
+            continue
+        session_key = "opencode:" + str(session_id)
+        sessions.add(session_key)
+        active_days.add(day)
+        prompts += 1
+        bucket = model_usage.setdefault(model, _bucket())
+        bucket["inputTokens"] += inp
+        bucket["outputTokens"] += out
+        bucket["cacheReadInputTokens"] += cr
+        bucket["cacheCreationInputTokens"] += cw
+        if day in recent:
+            recent[day] += total
+        if day == today:
+            today_prompts += 1
+            today_sessions.add(session_key)
+            today_tokens += total
+            today_by_model[model] = today_by_model.get(model, 0) + total
+
+    if prompts == 0:
+        stats = None
+    else:
+        stats = {
+            "todayPrompts": today_prompts,
+            "todaySessions": len(today_sessions),
+            "todayTotalTokens": today_tokens,
+            "todayTokensByModel": today_by_model,
+            "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent],
+            "modelUsage": model_usage,
+            "totalPrompts": prompts,
+            "totalSessions": len(sessions),
+            "activeDays": len(active_days),
+            "activeDates": sorted(active_days),
+        }
+    write_json_private(cache_path, {"cachedAtMs": now_ms(), "stats": stats})
+    return stats
 
 
 def build_record(limits_result: dict, stats: Optional[dict]) -> dict:
