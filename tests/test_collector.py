@@ -101,5 +101,148 @@ class RecordTest(unittest.TestCase):
         self.assertTrue(rec["retryAdvised"])
 
 
+import http.server
+import threading
+
+
+class StubServer:
+    """One-shot loopback HTTP server with a configurable response."""
+
+    def __init__(self, status=200, body=b"{}", headers=None, chunks=None):
+        self.status = status
+        self.body = body
+        self.headers = headers or {"Content-Type": "application/json"}
+        self.chunks = chunks  # list[bytes] streamed instead of body
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                outer.requests.append(self.path)
+                self.send_response(outer.status)
+                for k, v in outer.headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                try:
+                    if outer.chunks is not None:
+                        for chunk in outer.chunks:
+                            self.wfile.write(chunk)
+                    else:
+                        self.wfile.write(outer.body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}/usage"
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def ok_body(rolling=6, weekly=23, monthly=34, status="ok"):
+    return json.dumps({"usage": {
+        "rolling": {"status": status, "percent": rolling, "resetsAt": "2026-09-10T14:14:24.749Z"},
+        "weekly": {"status": status, "percent": weekly, "resetsAt": "2026-09-14T00:00:00.749Z"},
+        "monthly": {"status": status, "percent": monthly, "resetsAt": "2026-09-21T11:07:36.749Z"}},
+    }).encode()
+
+
+class LimitsHttpTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_collector()
+        self._saved = os.environ.get("OPENCODE_GO_USAGE_URL")
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._saved is None:
+            os.environ.pop("OPENCODE_GO_USAGE_URL", None)
+        else:
+            os.environ["OPENCODE_GO_USAGE_URL"] = self._saved
+
+    def test_maps_windows_to_fraction_limits(self):
+        with StubServer(200, ok_body()) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["ok"])
+        self.assertEqual([w["label"] for w in result["limits"]],
+                         ["Session (5-hour)", "Weekly (7-day)", "Monthly (30-day)"])
+        self.assertEqual([round(w["percent"], 4) for w in result["limits"]],
+                         [0.06, 0.23, 0.34])
+        self.assertEqual(result["limits"][0]["resetsAt"], "2026-09-10T14:14:24.749Z")
+
+    def test_percent_validation_omits_bad_windows(self):
+        body = json.dumps({"usage": {
+            "rolling": {"status": "ok", "percent": -1, "resetsAt": ""},
+            "weekly": {"status": "ok", "percent": 150, "resetsAt": ""},
+            "monthly": {"status": "ok", "percent": "34", "resetsAt": ""}}}).encode()
+        with StubServer(200, body) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["transport"])
+
+    def test_zero_window_payload_is_transport_failure(self):
+        with StubServer(200, json.dumps({"usage": {}}).encode()) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+        self.assertEqual(result["limits"], [])
+
+    def test_401_and_403_states(self):
+        for status, state_fragment in ((401, "expired"), (403, "subscription")):
+            with StubServer(status, b"{}") as srv:
+                os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+                result = self.mod.probe_limits("sk-x")
+            self.assertFalse(result["transport"])
+            self.assertIn(state_fragment, result["state"].lower())
+
+    def test_500_is_transport_failure(self):
+        with StubServer(500, b"{}") as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_oversized_body_rejected(self):
+        big = b"x" * (65536 + 100)
+        with StubServer(200, big) as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_malformed_json_is_transport_failure(self):
+        with StubServer(200, b"{ not json") as srv:
+            os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_connection_refused_is_transport_failure(self):
+        os.environ["OPENCODE_GO_USAGE_URL"] = "http://127.0.0.1:9/usage"
+        result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["transport"])
+
+    def test_non_loopback_override_ignored(self):
+        with StubServer(200, ok_body()) as srv:
+            self.mod.REAL_ENDPOINT = srv.url  # the "real" endpoint is our stub
+            os.environ["OPENCODE_GO_USAGE_URL"] = "http://example.com/usage"
+            result = self.mod.probe_limits("sk-x")
+        self.assertTrue(result["ok"])
+        self.assertEqual(srv.requests, ["/usage"])
+
+    def test_override_rejects_query_fragment_credentials(self):
+        for bad in ("http://127.0.0.1:1/usage?x=1", "http://127.0.0.1:1/usage#f",
+                    "http://u:p@127.0.0.1:1/usage", "http://[::ffff:127.0.0.1]:1/usage"):
+            os.environ["OPENCODE_GO_USAGE_URL"] = bad
+            self.assertEqual(self.mod.endpoint_url(), self.mod.REAL_ENDPOINT)
+
+
 if __name__ == "__main__":
     unittest.main()

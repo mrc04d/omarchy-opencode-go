@@ -140,8 +140,80 @@ def endpoint_url() -> str:
     return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
 
 
+def parse_usage(payload: Any) -> list:
+    if not isinstance(payload, dict):
+        return []
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return []
+    limits = []
+    for key, label in WINDOW_LABELS:
+        window = usage.get(key)
+        if not isinstance(window, dict) or window.get("status") != "ok":
+            continue
+        percent = real_number(window.get("percent"))
+        if percent is None or percent < 0 or percent > 100:
+            continue
+        resets = window.get("resetsAt")
+        limits.append({
+            "label": label,
+            "percent": max(0.0, min(1.0, percent / 100.0)),
+            "resetsAt": resets if isinstance(resets, str) else "",
+        })
+    return limits
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def probe_limits(key: str) -> dict:
-    return {"ok": False, "limits": [], "state": "", "transport": False}
+    url = endpoint_url()
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {key}", "User-Agent": USER_AGENT},
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        response = opener.open(request, timeout=TIMEOUT_SECONDS)
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            return {"ok": False, "limits": [], "state": "Sign-in expired", "transport": False}
+        if error.code == 403:
+            return {"ok": False, "limits": [], "state": "No Go subscription", "transport": False}
+        return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
+    except (urllib.error.URLError, OSError, ValueError):
+        return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
+
+    try:
+        status = response.status
+        if status < 200 or status >= 300:
+            return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
+        total = 0
+        chunks = []
+        while True:
+            chunk = response.read(min(READ_CHUNK, BODY_LIMIT + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > BODY_LIMIT:
+                response.close()
+                return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        response.close()
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
+
+    limits = parse_usage(payload)
+    if not limits:
+        return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
+    return {"ok": True, "limits": limits, "state": "", "transport": False}
 
 
 def collect_limits(key: str, force: bool) -> dict:
