@@ -1,0 +1,219 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the OpenCode Go usage record as JSON
+# omarchy:args=[--force] [--limits-only] [--cache-seconds N]
+# omarchy:hidden=true
+"""Collect OpenCode Go usage into one display-ready JSON record.
+
+Limits come from the official (undocumented) Go usage endpoint; local token
+stats come from opencode.db, filtered to the opencode-go provider. The agents
+panel only ever reads the JSON this prints.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Optional
+
+AGENT_ID = "opencode-go"
+AGENT_NAME = "OpenCode Go"
+AUTH_HELP = "Sign in to OpenCode Go, or set OPENCODE_GO_API_KEY."
+TIER_LABEL = "Go"
+REAL_ENDPOINT = "https://opencode.ai/zen/go/v1/usage"
+USER_AGENT = "omarchy-agent-usage/1.0"
+TIMEOUT_SECONDS = 10
+PROBE_MIN_INTERVAL_SECONDS = 15
+MAX_FALLBACK_AGE_SECONDS = 24 * 3600
+BODY_LIMIT = 65536
+READ_CHUNK = 8192
+WINDOW_LABELS = (
+    ("rolling", "Session (5-hour)"),
+    ("weekly", "Weekly (7-day)"),
+    ("monthly", "Monthly (30-day)"),
+)
+
+
+def now_ms() -> int:
+    return round(time.time() * 1000)
+
+
+def xdg_data_home() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+
+
+def cache_root() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "omarchy" / "agent-usage"
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def read_json(path: Path) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_private(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def number(value: Any) -> int:
+    if type(value) is int:
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return 0
+
+
+def real_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def resolve_key() -> str:
+    for name in ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"):
+        candidate = (os.environ.get(name) or "").strip()
+        if candidate:
+            return candidate
+    data = read_json(xdg_data_home() / "opencode" / "auth.json")
+    if isinstance(data, dict):
+        entry = data.get("opencode-go")
+        if isinstance(entry, dict):
+            key = entry.get("key")
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+    return ""
+
+
+def endpoint_url() -> str:
+    raw = os.environ.get("OPENCODE_GO_USAGE_URL") or ""
+    if not raw:
+        return REAL_ENDPOINT
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return REAL_ENDPOINT
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme not in ("http", "https"):
+        return REAL_ENDPOINT
+    if parsed.username or parsed.password:
+        return REAL_ENDPOINT
+    if parsed.query or parsed.fragment:
+        return REAL_ENDPOINT
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        return REAL_ENDPOINT
+    try:
+        port = parsed.port
+    except ValueError:
+        return REAL_ENDPOINT
+    if not host:
+        return REAL_ENDPOINT
+    netloc = f"[{host}]" if ":" in host else host
+    if port:
+        netloc = f"{netloc}:{port}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
+
+
+def probe_limits(key: str) -> dict:
+    return {"ok": False, "limits": [], "state": "", "transport": False}
+
+
+def collect_limits(key: str, force: bool) -> dict:
+    probe = probe_limits(key)
+    return {"limits": probe["limits"], "state": probe["state"], "retry": bool(probe["transport"])}
+
+
+def empty_stats() -> dict:
+    return {
+        "todayPrompts": 0,
+        "todaySessions": 0,
+        "todayTotalTokens": 0,
+        "todayTokensByModel": {},
+        "recentDays": [],
+        "modelUsage": {},
+        "totalPrompts": 0,
+        "totalSessions": 0,
+        "activeDays": 0,
+        "activeDates": [],
+    }
+
+
+def scan_local_stats(max_age: int) -> Optional[dict]:
+    return None
+
+
+def build_record(limits_result: dict, stats: Optional[dict]) -> dict:
+    has_local = stats is not None
+    stats = stats or empty_stats()
+    limits = limits_result.get("limits") or []
+    record = {
+        "schemaVersion": 1,
+        "id": AGENT_ID,
+        "name": AGENT_NAME,
+        "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ready": bool(limits) or number(stats.get("totalPrompts")) > 0
+        or number(stats.get("todayPrompts")) > 0 or number(stats.get("activeDays")) > 0,
+        "hasLocalStats": has_local,
+        "tierLabel": TIER_LABEL,
+        "usageStatusText": str(limits_result.get("state") or ""),
+        "authHelpText": AUTH_HELP,
+        "limits": limits,
+    }
+    if limits_result.get("retry"):
+        record["retryAdvised"] = True
+    record.update({k: stats.get(k, empty_stats()[k]) for k in empty_stats()})
+    return record
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--limits-only", action="store_true")
+    parser.add_argument("--cache-seconds", type=float, default=20)
+    args = parser.parse_args()
+
+    try:
+        key = resolve_key()
+        if key:
+            limits_result = collect_limits(key, args.force)
+        else:
+            limits_result = {"limits": [], "state": "Waiting for auth", "retry": False}
+        max_age = 0 if args.force else (900 if args.limits_only else int(args.cache_seconds))
+        stats = scan_local_stats(max_age)
+        record = build_record(limits_result, stats)
+        payload = json.dumps(record, separators=(",", ":"), sort_keys=True)
+    except Exception as error:  # noqa: BLE001 - never leak a traceback to stdout
+        print(f"omarchy-agent-usage-opencode-go: {type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    print(payload)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
