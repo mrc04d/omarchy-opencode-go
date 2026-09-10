@@ -359,6 +359,8 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
 
     cache_path = stats_cache_path(db)
     cached = read_json(cache_path)
+    if not isinstance(cached, dict):
+        cached = None
     if cached is not None:
         if type(cached.get("cachedAtMs")) is int and (time.time() * 1000 - cached["cachedAtMs"]) <= max_age * 1000:
             stats = _valid_cached_stats(cached)

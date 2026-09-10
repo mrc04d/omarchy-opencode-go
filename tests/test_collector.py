@@ -454,6 +454,14 @@ class LocalStatsTest(unittest.TestCase):
         cache.write_text("{ not json")
         self.assertIsNotNone(self.mod.scan_local_stats(0))  # re-scans instead of trusting
 
+    def test_non_dict_cache_is_ignored(self):
+        self.mod.scan_local_stats(0)
+        cache = next(pathlib.Path(self.tmp.name).rglob("opencode-go-opencode-*.json"))
+        cache.write_text("[]")
+        stats = self.mod.scan_local_stats(0)  # re-scans instead of crashing
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["totalPrompts"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
