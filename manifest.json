@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "matt.agents",
   "name": "My Agents",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Omarchy",
   "license": "MIT",
   "description": "Claude Code, Codex, and Fireworks usage, limits, and pace in a native Omarchy bar panel.",
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "My Agents",
-    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription.",
+    "description": "One bar icon and one panel: rate-limit meters with pace, today, the last week, and the all-time model breakdown for every subscription. Includes OpenCode Go.",
     "category": "AI",
     "aliases": [
       "agents",
@@ -31,6 +31,9 @@
           "enabled": true
         },
         "fireworks": {
+          "enabled": true
+        },
+        "opencode-go": {
           "enabled": true
         }
       },

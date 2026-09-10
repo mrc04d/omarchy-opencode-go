@@ -12,6 +12,9 @@ Item {
 
   property var settings: ({})
 
+  readonly property string updateHelper: decodeURIComponent(
+    Qt.resolvedUrl("helpers/agents-update.sh").toString().replace(/^file:\/\//, ""))
+
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
 
@@ -144,7 +147,7 @@ Item {
   }
 
   function updateCommand(kind, agentIds) {
-    var command = ["omarchy-agent-usage-update"]
+    var command = [root.updateHelper]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}

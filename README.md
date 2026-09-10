@@ -148,3 +148,17 @@ One caveat on "all-time": the Codex collector only reads native session files
 touched in the last 30 days, and Fireworks requests the last 30 days from its
 billing API, so their totals and day counts cover that window. Claude's cover
 every transcript still on disk.
+
+### OpenCode Go
+
+The `opencode-go` collector covers the OpenCode Go (Zen) subscription. It reads
+its API key from `OPENCODE_GO_API_KEY`, then `OPENCODE_API_KEY`, then the
+`opencode-go.key` entry in `~/.local/share/opencode/auth.json`. Rate limits come
+from `https://opencode.ai/zen/go/v1/usage` as rolling (5-hour), weekly (7-day),
+and monthly (30-day) windows; local token usage is scanned from `opencode.db`.
+It is enabled by default alongside the other providers. To hide it, disable the
+provider:
+
+```json
+"opencode-go": { "enabled": false }
+```
