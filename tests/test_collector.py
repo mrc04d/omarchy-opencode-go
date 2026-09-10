@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import datetime as dt
 import importlib.machinery
 import importlib.util
 import json
@@ -301,21 +302,31 @@ class LimitsCacheTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self._saved_cache = os.environ.get("XDG_CACHE_HOME")
+        self._saved_url = os.environ.get("OPENCODE_GO_USAGE_URL")
         os.environ["XDG_CACHE_HOME"] = self.tmp.name
         self.cache = pathlib.Path(self.tmp.name) / "omarchy" / "agent-usage" / "opencode-go-limits.json"
 
     def tearDown(self):
-        if self._saved_cache is None:
-            os.environ.pop("XDG_CACHE_HOME", None)
-        else:
-            os.environ["XDG_CACHE_HOME"] = self._saved_cache
+        for name, saved in (("XDG_CACHE_HOME", self._saved_cache),
+                            ("OPENCODE_GO_USAGE_URL", self._saved_url)):
+            if saved is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = saved
 
     def seed(self, fetched_at_ms, limits):
         self.cache.parent.mkdir(parents=True, exist_ok=True)
         self.cache.write_text(json.dumps({"fetchedAtMs": fetched_at_ms, "limits": limits}))
 
+    def future_body(self):
+        resets = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
+        return json.dumps({"usage": {
+            "rolling": {"status": "ok", "percent": 6, "resetsAt": resets},
+            "weekly": {"status": "ok", "percent": 23, "resetsAt": resets},
+            "monthly": {"status": "ok", "percent": 34, "resetsAt": resets}}}).encode()
+
     def test_success_writes_cache_and_reuses_within_15s(self):
-        with StubServer(200, ok_body()) as srv:
+        with StubServer(200, self.future_body()) as srv:
             os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
             first = self.mod.collect_limits("sk-x", False)
             self.assertTrue(first["limits"])
@@ -352,6 +363,19 @@ class LimitsCacheTest(unittest.TestCase):
             os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
             result = self.mod.collect_limits("sk-x", True)
         self.assertEqual([w["label"] for w in result["limits"]], ["Weekly (7-day)"])
+
+    def test_malformed_cache_entry_rejected_wholesale(self):
+        for bad in ({"label": "Bad", "percent": 5.0, "resetsAt": ""},
+                    {"label": "Bad", "percent": "half", "resetsAt": ""},
+                    "not-a-dict"):
+            with self.subTest(bad=bad):
+                self.seed(self.mod.now_ms(), [
+                    {"label": "Session (5-hour)", "percent": 0.1, "resetsAt": ""}, bad])
+                with StubServer(500, b"{}") as srv:
+                    os.environ["OPENCODE_GO_USAGE_URL"] = srv.url
+                    result = self.mod.collect_limits("sk-x", True)
+                self.assertEqual(result["limits"], [])
+                self.assertTrue(result["retry"])
 
     def test_401_does_not_use_fallback(self):
         self.seed(self.mod.now_ms(), [{"label": "Session (5-hour)", "percent": 0.1, "resetsAt": ""}])
