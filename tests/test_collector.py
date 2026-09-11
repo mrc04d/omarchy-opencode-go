@@ -496,5 +496,70 @@ class LocalStatsTest(unittest.TestCase):
         self.assertEqual(stats["totalPrompts"], 1)
 
 
+class BoundsTest(unittest.TestCase):
+    """Untrusted auth.json / DB rows are refused before they are parsed."""
+
+    def setUp(self):
+        self.mod = load_collector()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self._saved = {k: os.environ.get(k) for k in
+                       ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "XDG_DATA_HOME", "XDG_CACHE_HOME")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        os.environ["XDG_DATA_HOME"] = self.tmp.name
+        os.environ["XDG_CACHE_HOME"] = self.tmp.name
+        (pathlib.Path(self.tmp.name) / "opencode").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def auth_path(self):
+        return pathlib.Path(self.tmp.name) / "opencode" / "auth.json"
+
+    def test_oversized_auth_json_is_refused(self):
+        pad = "a" * (self.mod.MAX_JSON_BYTES + 10)
+        self.auth_path().write_text(json.dumps({"opencode-go": {"key": "sk-x"}, "pad": pad}))
+        self.assertEqual(self.mod.resolve_key(), "")
+
+    def test_symlinked_auth_json_is_refused(self):
+        real = pathlib.Path(self.tmp.name) / "real.json"
+        real.write_text(json.dumps({"opencode-go": {"key": "sk-sym"}}))
+        self.auth_path().symlink_to(real)
+        self.assertEqual(self.mod.resolve_key(), "")
+
+    def test_overlong_env_key_is_ignored_and_auth_used(self):
+        os.environ["OPENCODE_GO_API_KEY"] = "x" * (self.mod.MAX_KEY_LEN + 1)
+        self.auth_path().write_text(json.dumps({"opencode-go": {"key": "sk-ok"}}))
+        self.assertEqual(self.mod.resolve_key(), "sk-ok")
+
+    def test_oversized_db_row_is_skipped(self):
+        db = pathlib.Path(self.tmp.name) / "opencode" / "opencode.db"
+        conn = _sqlite3.connect(db)
+        conn.execute("CREATE TABLE message (session_id TEXT, data TEXT)")
+        now = round(_dt.datetime.now().timestamp() * 1000)
+        big = json.dumps({
+            "role": "assistant", "providerID": "opencode-go", "modelID": "big",
+            "tokens": {"input": 5}, "time": {"created": now},
+            "pad": "a" * (self.mod.MAX_JSON_BYTES + 10),
+        })
+        small = json.dumps({
+            "role": "assistant", "providerID": "opencode-go", "modelID": "deepseek-flash",
+            "tokens": {"input": 7}, "time": {"created": now},
+        })
+        conn.execute("INSERT INTO message VALUES ('s1', ?)", (big,))
+        conn.execute("INSERT INTO message VALUES ('s2', ?)", (small,))
+        conn.commit()
+        conn.close()
+        stats = self.mod.scan_local_stats(0)
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["totalPrompts"], 1)
+        self.assertEqual(stats["modelUsage"].get("big"), None)
+
+
 if __name__ == "__main__":
     unittest.main()

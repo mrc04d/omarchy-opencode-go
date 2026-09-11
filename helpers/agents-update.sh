@@ -1,12 +1,27 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 # Wraps omarchy-agent-usage-update and adds the opencode-go collector.
 # Grammar: [--force] [--limits-only] [--except <agent>] [agent...]
+#
+# Security posture: fixed absolute tool paths (no PATH lookup), a fixed install
+# root (no environment redirection of which executables run), an absolute
+# stock-updater path, a validated bundled collector, and a hard subprocess
+# timeout. No value taken from the environment selects an executable.
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 COLLECTOR="$SCRIPT_DIR/omarchy-agent-usage-opencode-go"
 USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
-omarchy_root="${OMARCHY_PATH:-/usr/share/omarchy}"
+OMARCHY_ROOT=/usr/share/omarchy
+
+SORT=/usr/bin/sort
+JQ=/usr/bin/jq
+INSTALL=/usr/bin/install
+MKTEMP=/usr/bin/mktemp
+MV=/usr/bin/mv
+RM=/usr/bin/rm
+TIMEOUT=/usr/bin/timeout
+STOCK=/usr/bin/omarchy-agent-usage-update
+SUBPROCESS_TIMEOUT_SECONDS=120
 
 force=0
 limits_only=0
@@ -40,15 +55,16 @@ is_excluded() {
   return 1
 }
 
+# Stock agent ids, discovered only from the trusted installed root.
 stock_ids=()
-for collector in "$omarchy_root"/bin/omarchy-agent-usage-*; do
+for collector in "$OMARCHY_ROOT"/bin/omarchy-agent-usage-*; do
   [[ -x $collector ]] || continue
   agent="${collector##*/omarchy-agent-usage-}"
   [[ $agent == "update" ]] && continue
   stock_ids+=("$agent")
 done
 if (( ${#stock_ids[@]} )); then
-  mapfile -t stock_ids < <(printf '%s\n' "${stock_ids[@]}" | sort)
+  mapfile -t stock_ids < <(printf '%s\n' "${stock_ids[@]}" | "$SORT")
 fi
 
 in_stock() {
@@ -76,10 +92,12 @@ if ! { (( ${#only[@]} > 0 )) && (( ${#stock_only[@]} == 0 )); }; then
   if (( ${#only[@]} > 0 )); then
     stock_args+=("${stock_only[@]}")
   fi
-  if (( ${#stock_args[@]} > 0 )); then
-    omarchy-agent-usage-update "${stock_args[@]}" || true
-  else
-    omarchy-agent-usage-update || true
+  if [[ -x $STOCK ]]; then
+    if (( ${#stock_args[@]} > 0 )); then
+      "$TIMEOUT" "$SUBPROCESS_TIMEOUT_SECONDS" "$STOCK" "${stock_args[@]}" || true
+    else
+      "$TIMEOUT" "$SUBPROCESS_TIMEOUT_SECONDS" "$STOCK" || true
+    fi
   fi
 fi
 
@@ -94,22 +112,29 @@ fi
 
 (( wanted )) || exit 0
 
-command -v jq >/dev/null 2>&1 || { echo "agents-update: jq is required but not found" >&2; exit 1; }
+[[ -x $JQ ]] || { echo "agents-update: jq is required but not found" >&2; exit 1; }
 
-if ! install -d -m 700 "$USAGE_DIR"; then
+# The bundled collector must be a regular, executable file owned by us; never a
+# symlink or a file substituted through the environment.
+if [[ ! -f $COLLECTOR || -L $COLLECTOR || ! -x $COLLECTOR || ! -O $COLLECTOR ]]; then
+  echo "agents-update: bundled collector is not a trusted executable" >&2
+  exit 1
+fi
+
+if ! "$INSTALL" -d -m 700 "$USAGE_DIR"; then
   echo "agents-update: could not create $USAGE_DIR" >&2
   exit 1
 fi
-tmp="$(mktemp "$USAGE_DIR/.opencode-go.XXXXXX")" || { echo "agents-update: could not create temp file" >&2; exit 1; }
-trap 'rm -f "$tmp"' EXIT
+tmp="$("$MKTEMP" "$USAGE_DIR/.opencode-go.XXXXXX")" || { echo "agents-update: could not create temp file" >&2; exit 1; }
+trap '"$RM" -f "$tmp"' EXIT
 
-if ! record="$("$COLLECTOR" "${flags[@]}")" || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
+if ! record="$("$TIMEOUT" "$SUBPROCESS_TIMEOUT_SECONDS" "$COLLECTOR" "${flags[@]}")" || [[ -z $record ]] || ! "$JQ" -e . >/dev/null 2>&1 <<<"$record"; then
   echo "agents-update: opencode-go collector failed" >&2
   exit 1
 fi
 
 printf '%s\n' "$record" >"$tmp"
-if ! mv "$tmp" "$USAGE_DIR/opencode-go.json"; then
+if ! "$MV" "$tmp" "$USAGE_DIR/opencode-go.json"; then
   echo "agents-update: could not install opencode-go record" >&2
   exit 1
 fi

@@ -17,6 +17,7 @@ import http.client
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -37,6 +38,18 @@ PROBE_MIN_INTERVAL_SECONDS = 15
 MAX_FALLBACK_AGE_SECONDS = 24 * 3600
 BODY_LIMIT = 65536
 READ_CHUNK = 8192
+# Untrusted-input bounds. auth.json and the caches are read with these caps;
+# a hostile oversized/foreign file is refused before it is parsed.
+MAX_JSON_BYTES = 1_048_576
+MAX_KEY_LEN = 512
+MAX_LABEL_LEN = 128
+MAX_CACHE_ENTRIES = 64
+# opencode.db scan bounds: rows examined, wall-clock budget, and cardinality.
+MAX_DB_ROWS = 200_000
+MAX_DB_DEADLINE_SECONDS = 5.0
+MAX_MODELS = 1_000
+MAX_SESSIONS = 100_000
+MAX_FIELD_LEN = 200
 WINDOW_LABELS = (
     ("rolling", "Session (5-hour)"),
     ("weekly", "Weekly (7-day)"),
@@ -59,10 +72,25 @@ def cache_root() -> Path:
     return root
 
 
-def read_json(path: Path) -> Any:
+def read_json(path: Path, max_bytes: int = MAX_JSON_BYTES) -> Any:
+    """Read a small, local, trusted-owner JSON file.
+
+    Refuses symlinks, non-regular files, files not owned by this user, and
+    anything larger than ``max_bytes``. Any failure is best-effort -> None.
+    """
     try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if info.st_uid != os.getuid():
+            return None
+        if info.st_size > max_bytes:
+            return None
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            data = fh.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            return None
+        return json.loads(data)
     except (OSError, ValueError):
         return None
 
@@ -100,15 +128,17 @@ def real_number(value: Any) -> Optional[float]:
 def resolve_key() -> str:
     for name in ("OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"):
         candidate = (os.environ.get(name) or "").strip()
-        if candidate:
+        if candidate and len(candidate) <= MAX_KEY_LEN:
             return candidate
     data = read_json(xdg_data_home() / "opencode" / "auth.json")
     if isinstance(data, dict):
         entry = data.get("opencode-go")
         if isinstance(entry, dict):
             key = entry.get("key")
-            if isinstance(key, str) and key.strip():
-                return key.strip()
+            if isinstance(key, str):
+                key = key.strip()
+                if key and len(key) <= MAX_KEY_LEN:
+                    return key
     return ""
 
 
@@ -176,6 +206,9 @@ def probe_limits(key: str) -> dict:
         headers={"Authorization": f"Bearer {key}", "User-Agent": USER_AGENT},
     )
     opener = urllib.request.build_opener(_NoRedirect)
+    # Absolute deadline: a per-read timeout alone lets a peer keep the loop
+    # alive by dribbling chunks; check elapsed time on every read.
+    deadline = time.monotonic() + TIMEOUT_SECONDS
     try:
         response = opener.open(request, timeout=TIMEOUT_SECONDS)
     except urllib.error.HTTPError as error:
@@ -194,6 +227,8 @@ def probe_limits(key: str) -> dict:
         total = 0
         chunks = []
         while True:
+            if time.monotonic() > deadline:
+                return {"ok": False, "limits": [], "state": "OpenCode Go limits unavailable", "transport": True}
             chunk = response.read(min(READ_CHUNK, BODY_LIMIT + 1 - total))
             if not chunk:
                 break
@@ -379,6 +414,13 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
                 if stats is not None:
                     return stats
 
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    recent = {day: 0 for day in recent_date_strings()}
+    sessions, active_days, today_sessions = set(), set(), set()
+    model_usage, today_by_model = {}, {}
+    today_prompts = today_tokens = prompts = 0
+    started = time.monotonic()
+
     try:
         conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
     except (sqlite3.Error, OSError, RuntimeError):
@@ -386,58 +428,62 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
     try:
         conn.execute("PRAGMA query_only = ON")
         conn.execute("PRAGMA busy_timeout = 2000")
-        rows = list(conn.execute("SELECT session_id, data FROM message"))
+        # Stream with a hard row cap and a wall-clock budget; never materialize
+        # the whole table, and cap the cardinality of everything derived from
+        # attacker-controlled DB strings.
+        cursor = conn.execute("SELECT session_id, data FROM message LIMIT ?", (MAX_DB_ROWS,))
+        for session_id, raw in cursor:
+            if time.monotonic() - started > MAX_DB_DEADLINE_SECONDS:
+                break
+            if not isinstance(raw, str) or len(raw) > MAX_JSON_BYTES:
+                continue
+            try:
+                entry = json.loads(raw)
+                if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                    continue
+                if str(entry.get("providerID") or "") != AGENT_ID:
+                    continue
+                tokens = entry.get("tokens") or {}
+                cache = tokens.get("cache") or {}
+                inp = number(tokens.get("input"))
+                out = number(tokens.get("output")) + number(tokens.get("reasoning"))
+                cr = number(cache.get("read"))
+                cw = number(cache.get("write"))
+                total = inp + out + cr + cw
+                if total <= 0:
+                    continue
+                created = number((entry.get("time") or {}).get("created"))
+                if created > 0:
+                    day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
+                else:
+                    day = today
+                model = str(entry.get("modelID") or AGENT_ID).rstrip("/").split("/")[-1][:MAX_FIELD_LEN] or "unknown"
+            except Exception:
+                continue
+            session_key = "opencode:" + str(session_id)[:MAX_FIELD_LEN]
+            if len(sessions) < MAX_SESSIONS:
+                sessions.add(session_key)
+            active_days.add(day)
+            prompts += 1
+            if model in model_usage or len(model_usage) < MAX_MODELS:
+                bucket = model_usage.setdefault(model, _bucket())
+                bucket["inputTokens"] += inp
+                bucket["outputTokens"] += out
+                bucket["cacheReadInputTokens"] += cr
+                bucket["cacheCreationInputTokens"] += cw
+            if day in recent:
+                recent[day] += total
+            if day == today:
+                today_prompts += 1
+                if len(today_sessions) < MAX_SESSIONS:
+                    today_sessions.add(session_key)
+                today_tokens += total
+                if model in today_by_model or len(today_by_model) < MAX_MODELS:
+                    today_by_model[model] = today_by_model.get(model, 0) + total
     except sqlite3.Error:
         return None
     finally:
         conn.close()
-
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    recent = {day: 0 for day in recent_date_strings()}
-    sessions, active_days, today_sessions = set(), set(), set()
-    model_usage, today_by_model = {}, {}
-    today_prompts = today_tokens = prompts = 0
-
-    for session_id, raw in rows:
-        try:
-            entry = json.loads(raw)
-            if not isinstance(entry, dict) or entry.get("role") != "assistant":
-                continue
-            if str(entry.get("providerID") or "") != AGENT_ID:
-                continue
-            tokens = entry.get("tokens") or {}
-            cache = tokens.get("cache") or {}
-            inp = number(tokens.get("input"))
-            out = number(tokens.get("output")) + number(tokens.get("reasoning"))
-            cr = number(cache.get("read"))
-            cw = number(cache.get("write"))
-            total = inp + out + cr + cw
-            if total <= 0:
-                continue
-            created = number((entry.get("time") or {}).get("created"))
-            if created > 0:
-                day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
-            else:
-                day = today
-            model = str(entry.get("modelID") or "opencode-go").rstrip("/").split("/")[-1]
-        except Exception:
-            continue
-        session_key = "opencode:" + str(session_id)
-        sessions.add(session_key)
-        active_days.add(day)
-        prompts += 1
-        bucket = model_usage.setdefault(model, _bucket())
-        bucket["inputTokens"] += inp
-        bucket["outputTokens"] += out
-        bucket["cacheReadInputTokens"] += cr
-        bucket["cacheCreationInputTokens"] += cw
-        if day in recent:
-            recent[day] += total
-        if day == today:
-            today_prompts += 1
-            today_sessions.add(session_key)
-            today_tokens += total
-            today_by_model[model] = today_by_model.get(model, 0) + total
 
     if prompts == 0:
         stats = None

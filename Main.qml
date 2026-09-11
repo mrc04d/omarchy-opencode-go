@@ -30,7 +30,7 @@ Item {
   Process {
     id: listProcess
     running: false
-    command: ["find", root.usageDir, "-maxdepth", "1", "-name", "*.json", "-printf", "%f\n"]
+    command: ["/usr/bin/find", root.usageDir, "-maxdepth", "1", "-name", "*.json", "-printf", "%f\n"]
 
     stdout: StdioCollector {
       waitForEnd: true
@@ -151,7 +151,7 @@ Item {
   }
 
   function updateCommand(kind, agentIds) {
-    var command = [root.updateHelper]
+    var command = ["/usr/bin/timeout", "120", root.updateHelper]
     if (kind === "force") command.push("--force")
     if (kind === "limits") command.push("--limits-only")
     var providers = settings && settings.providers ? settings.providers : {}
@@ -408,7 +408,7 @@ Item {
 
     syncRequestedWhileRunning = false
     syncStatusText = ""
-    syncMkdirProcess.command = ["mkdir", "-p", root.syncEffectiveDir]
+    syncMkdirProcess.command = ["/usr/bin/mkdir", "-p", root.syncEffectiveDir]
     syncMkdirProcess.running = true
   }
 
@@ -426,8 +426,8 @@ Item {
       finishSyncRun()
       return
     }
-    var script = "dir=$0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; printf '===%s===\\n' \"$f\"; cat \"$f\"; printf '\\n=== EOM ===\\n'; done"
-    syncScanProcess.command = ["bash", "-c", script, root.syncEffectiveDir]
+    var script = "dir=$0; max=262144; cap=4194304; maxfiles=200; total=0; count=0; [[ -d \"$dir\" ]] || exit 0; shopt -s nullglob; for f in \"$dir\"/*.json; do [[ -f \"$f\" ]] || continue; (( count++ >= maxfiles )) && break; sz=$(/usr/bin/stat -c%s -- \"$f\" 2>/dev/null || echo 0); (( sz <= 0 || sz > max )) && continue; (( total + sz > cap )) && break; total=$(( total + sz )); printf '===%s===\\n' \"$f\"; /usr/bin/head -c \"$max\" -- \"$f\"; printf '\\n=== EOM ===\\n'; done"
+    syncScanProcess.command = ["/usr/bin/bash", "-c", script, root.syncEffectiveDir]
     syncScanProcess.running = true
   }
 
