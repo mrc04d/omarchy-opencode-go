@@ -11,7 +11,9 @@ reads the official OpenCode Go usage endpoint and your local `opencode.db`.
 
 - **Limits** — percentage used per allowance window with a meter and a live
   reset countdown. OpenCode Go reports Session (5-hour), Weekly (7-day), and
-  Monthly (30-day).
+  Monthly (30-day). When the **weekly** usage runs ahead of the clock (used
+  more than the fraction of the week elapsed), the row turns urgent and is
+  marked **over pace**.
 - **Tokens by day** — the last week, today bolded, hover for detail.
 - **Tokens by model** — per-model totals scaled to the heaviest model,
   hover for the input / output / cache split.

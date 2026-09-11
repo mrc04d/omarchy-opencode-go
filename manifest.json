@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.mrc04d.opencode-go",
   "name": "OpenCode Go Usage",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Matt",
   "license": "MIT",
   "description": "Adds an OpenCode Go usage tab to the Omarchy agents bar panel: 5-hour, weekly, and monthly limits with resets, plus local token stats.",

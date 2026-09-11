@@ -755,7 +755,19 @@ Panel {
     id: limitRow
     property var window: null
 
-    readonly property bool alarming: window && window.percent >= 0.9
+    readonly property bool alarming: window && (window.percent >= 0.9 || paceAlarming)
+
+    // Pace: for the weekly window, flag when the fraction used is ahead of the
+    // fraction of the window that has elapsed (you'll run out before it resets).
+    // A window with no parseable span or reset time is never flagged.
+    readonly property bool paceAlarming: {
+      if (!window || window.title !== "Weekly") return false
+      var span = root.windowSpanMs(window.label)
+      var remaining = root.resetMsFor(window)
+      if (!(span > 0) || !(remaining > 0)) return false
+      var fraction = Math.min(1, Math.max(0, span - remaining) / span)
+      return window.percent > fraction + 0.05
+    }
 
     spacing: Style.space(6)
 
@@ -805,9 +817,11 @@ Panel {
       width: parent.width
       text: {
         var remainingMs = root.resetMsFor(limitRow.window)
-        return remainingMs > 0 ? "Resets in " + root.formatDuration(remainingMs) : ""
+        if (!(remainingMs > 0)) return ""
+        var base = "Resets in " + root.formatDuration(remainingMs)
+        return limitRow.paceAlarming ? base + " · over pace" : base
       }
-      color: root.dim
+      color: limitRow.paceAlarming ? root.urgent : root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }
