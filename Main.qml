@@ -12,6 +12,9 @@ Item {
 
   property var settings: ({})
 
+  // When the collector last finished a run; the panel shows this as "Updated HH:mm".
+  property double lastRefreshMs: 0
+
   readonly property string updateHelper: decodeURIComponent(
     Qt.resolvedUrl("helpers/agents-update.sh").toString().replace(/^file:\/\//, ""))
 
@@ -132,6 +135,7 @@ Item {
     id: updateProcess
     running: false
     onExited: {
+      root.lastRefreshMs = Date.now()
       root.rescanAgents()
       if (root.pendingUpdateKind !== "") {
         var kind = root.pendingUpdateKind

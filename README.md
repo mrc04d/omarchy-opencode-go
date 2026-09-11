@@ -21,6 +21,16 @@ reads the official OpenCode Go usage endpoint and your local `opencode.db`.
 The widget hides itself from the bar when it has nothing to show, and appears
 the first time a scan finds usage.
 
+## Usage
+
+- **Click the bar icon** to open the panel; **Esc** closes it.
+- **Refresh** by pressing **R** (or **Enter**) in the panel, or clicking the
+  small **Refresh** button. The header shows **Updated HH:mm** — the last time
+  a collector run finished.
+- **Hover the bar icon** for the current limit percentages at a glance.
+- Switching subscriptions: **h**/**l**, the provider chips, or middle-click the
+  bar icon. Right-click the bar icon launches the agent.
+
 ## Requirements
 
 - Omarchy (Quattro) with the built-in `omarchy.agents` collectors. Claude,

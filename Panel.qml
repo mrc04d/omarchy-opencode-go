@@ -267,6 +267,25 @@ Panel {
     return ""
   }
 
+  // "Updated 14:03 · R" — the last time a collector run finished.
+  function updatedLabel() {
+    if (!usage.lastRefreshMs || usage.lastRefreshMs <= 0) return "Not refreshed yet · R"
+    return "Updated " + Qt.formatTime(new Date(usage.lastRefreshMs), "HH:mm") + " · R"
+  }
+
+  // Bar hover: the binding window's percentage, then a refresh hint.
+  function barTooltip() {
+    var parts = []
+    for (var i = 0; i < root.limits.length; i++) {
+      var w = root.limits[i]
+      parts.push(w.title + " " + Math.round(w.percent * 100) + "%")
+    }
+    var summary = parts.length > 0
+      ? parts.join(" · ")
+      : (root.provider ? root.provider.providerName : "OpenCode Go")
+    return summary + " — click for the panel, R to refresh"
+  }
+
   // Agents that ship a white mark carry an `assets/<id>-light.svg` twin for
   // light surfaces; marks that work on both (Claude's brand-orange) ship one
   // file. The luminance check decides which candidate to try first.
@@ -341,6 +360,7 @@ Panel {
     bar: root.bar
     text: "󱚣"
     active: root.alarming
+    tooltipText: root.barTooltip()
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.launchAgent()
       else if (buttonCode === Qt.MiddleButton) root.selectProvider(root.providerIndex + 1)
@@ -491,6 +511,36 @@ Panel {
                 }
                 onHovered: function(isHovered) { if (isHovered) root.cursorActive = true }
               }
+            }
+          }
+
+          // ---------- Updated / Refresh (kept in the header so it is always visible) ----------
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(refreshUpdated.implicitHeight, refreshButton.implicitHeight)
+
+            Text {
+              id: refreshUpdated
+              textFormat: Text.PlainText
+              text: root.updatedLabel()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            Button {
+              id: refreshButton
+              text: "Refresh"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              verticalPadding: Style.spacing.controlPaddingY
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: root.refreshNow()
             }
           }
 
