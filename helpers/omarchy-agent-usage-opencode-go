@@ -391,47 +391,42 @@ def _valid_cached_stats(cache: Any) -> Optional[dict]:
     return stats
 
 
-def scan_local_stats(max_age: int) -> Optional[dict]:
-    # The unresolved path keys the cache; only the resolved path opens the DB.
-    try:
-        db = (xdg_data_home() / "opencode" / "opencode.db").expanduser()
-    except (OSError, RuntimeError):
-        return None
-    if not db.is_file():
-        return None
+def _entry_provider(entry: dict) -> str:
+    """Extract providerID from both old (top-level) and new (nested) schemas."""
+    pid = entry.get("providerID")
+    if isinstance(pid, str) and pid:
+        return pid
+    model = entry.get("model")
+    if isinstance(model, dict):
+        pid = model.get("providerID")
+        if isinstance(pid, str) and pid:
+            return pid
+    return ""
 
-    try:
-        cache_path = stats_cache_path(db)
-    except OSError:
-        cache_path = None
-    if cache_path is not None:
-        cached = read_json(cache_path)
-        if not isinstance(cached, dict):
-            cached = None
-        if cached is not None:
-            if type(cached.get("cachedAtMs")) is int and (time.time() * 1000 - cached["cachedAtMs"]) <= max_age * 1000:
-                stats = _valid_cached_stats(cached)
-                if stats is not None:
-                    return stats
 
+def _entry_model(entry: dict) -> str:
+    """Extract modelID from both old (top-level) and new (nested) schemas."""
+    mid = entry.get("modelID")
+    if isinstance(mid, str) and mid:
+        return mid
+    model = entry.get("model")
+    if isinstance(model, dict):
+        mid = model.get("id")
+        if isinstance(mid, str) and mid:
+            return mid
+    return ""
+
+
+def _scan_table(conn, table: str, max_age: int, started: float) -> Optional[dict]:
+    """Scan a single message table (old or new schema) for opencode-go stats."""
     today = dt.datetime.now().strftime("%Y-%m-%d")
     recent = {day: 0 for day in recent_date_strings()}
     sessions, active_days, today_sessions = set(), set(), set()
     model_usage, today_by_model = {}, {}
     today_prompts = today_tokens = prompts = 0
-    started = time.monotonic()
 
     try:
-        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
-    except (sqlite3.Error, OSError, RuntimeError):
-        return None
-    try:
-        conn.execute("PRAGMA query_only = ON")
-        conn.execute("PRAGMA busy_timeout = 2000")
-        # Stream with a hard row cap and a wall-clock budget; never materialize
-        # the whole table, and cap the cardinality of everything derived from
-        # attacker-controlled DB strings.
-        cursor = conn.execute("SELECT session_id, data FROM message LIMIT ?", (MAX_DB_ROWS,))
+        cursor = conn.execute(f"SELECT session_id, data FROM {table} LIMIT ?", (MAX_DB_ROWS,))
         for session_id, raw in cursor:
             if time.monotonic() - started > MAX_DB_DEADLINE_SECONDS:
                 break
@@ -439,12 +434,16 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
                 continue
             try:
                 entry = json.loads(raw)
-                if not isinstance(entry, dict) or entry.get("role") != "assistant":
+                if not isinstance(entry, dict):
                     continue
-                if str(entry.get("providerID") or "") != AGENT_ID:
+                if str(_entry_provider(entry) or "") != AGENT_ID:
                     continue
                 tokens = entry.get("tokens") or {}
+                if not isinstance(tokens, dict):
+                    tokens = {}
                 cache = tokens.get("cache") or {}
+                if not isinstance(cache, dict):
+                    cache = {}
                 inp = number(tokens.get("input"))
                 out = number(tokens.get("output")) + number(tokens.get("reasoning"))
                 cr = number(cache.get("read"))
@@ -457,7 +456,7 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
                     day = dt.datetime.fromtimestamp(created / 1000).strftime("%Y-%m-%d")
                 else:
                     day = today
-                model = str(entry.get("modelID") or AGENT_ID).rstrip("/").split("/")[-1][:MAX_FIELD_LEN] or "unknown"
+                model = str(_entry_model(entry) or AGENT_ID).rstrip("/").split("/")[-1][:MAX_FIELD_LEN] or "unknown"
             except Exception:
                 continue
             session_key = "opencode:" + str(session_id)[:MAX_FIELD_LEN]
@@ -482,24 +481,71 @@ def scan_local_stats(max_age: int) -> Optional[dict]:
                     today_by_model[model] = today_by_model.get(model, 0) + total
     except sqlite3.Error:
         return None
+
+    if prompts == 0:
+        return None
+    return {
+        "todayPrompts": today_prompts,
+        "todaySessions": len(today_sessions),
+        "todayTotalTokens": today_tokens,
+        "todayTokensByModel": today_by_model,
+        "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent],
+        "modelUsage": model_usage,
+        "totalPrompts": prompts,
+        "totalSessions": len(sessions),
+        "activeDays": len(active_days),
+        "activeDates": sorted(active_days),
+    }
+
+
+def scan_local_stats(max_age: int) -> Optional[dict]:
+    # The unresolved path keys the cache; only the resolved path opens the DB.
+    try:
+        db = (xdg_data_home() / "opencode" / "opencode.db").expanduser()
+    except (OSError, RuntimeError):
+        return None
+    if not db.is_file():
+        return None
+
+    try:
+        cache_path = stats_cache_path(db)
+    except OSError:
+        cache_path = None
+    if cache_path is not None:
+        cached = read_json(cache_path)
+        if not isinstance(cached, dict):
+            cached = None
+        if cached is not None:
+            if type(cached.get("cachedAtMs")) is int and (time.time() * 1000 - cached["cachedAtMs"]) <= max_age * 1000:
+                stats = _valid_cached_stats(cached)
+                if stats is not None:
+                    return stats
+
+    started = time.monotonic()
+    try:
+        conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except (sqlite3.Error, OSError, RuntimeError):
+        return None
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        conn.execute("PRAGMA busy_timeout = 2000")
+        # opencode v2 migrated to a session_message table with a nested model
+        # object; the old message table is kept for backwards compatibility.
+        # Try the new table first, fall back to the old one.
+        tables = [row[0] for row in
+                  conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                               "AND name IN ('session_message', 'message') "
+                               "ORDER BY CASE name WHEN 'session_message' THEN 0 WHEN 'message' THEN 1 END").fetchall()]
+        stats = None
+        for table in tables:
+            stats = _scan_table(conn, table, max_age, started)
+            if stats is not None:
+                break
+    except sqlite3.Error:
+        return None
     finally:
         conn.close()
 
-    if prompts == 0:
-        stats = None
-    else:
-        stats = {
-            "todayPrompts": today_prompts,
-            "todaySessions": len(today_sessions),
-            "todayTotalTokens": today_tokens,
-            "todayTokensByModel": today_by_model,
-            "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent],
-            "modelUsage": model_usage,
-            "totalPrompts": prompts,
-            "totalSessions": len(sessions),
-            "activeDays": len(active_days),
-            "activeDates": sorted(active_days),
-        }
     if cache_path is not None:
         try:
             write_json_private(cache_path, {"cachedAtMs": now_ms(), "stats": stats})
