@@ -39,6 +39,9 @@ the first time a scan finds usage.
   Codex, and Fireworks tabs come from those stock collectors unchanged.
 - For the OpenCode Go tab: the `opencode` CLI signed in, or an OpenCode API
   key. No extra packages — the collector is stdlib-only Python 3.
+- **opencode v2** — the collector reads both the new `session_message` table
+  (nested `model.providerID`) and the legacy `message` table, so it works on
+  opencode v1 and v2 without migration.
 
 ## Install
 
@@ -100,6 +103,8 @@ finds. This plugin bundles a collector and a wrapper:
 
 - `helpers/omarchy-agent-usage-opencode-go` — stdlib-only Python collector.
   Fetches the Go limit windows and scans `opencode.db` for local tokens.
+  Reads the `session_message` table (opencode v2, nested `model.providerID`)
+  with a fallback to the legacy `message` table (opencode v1).
 - `helpers/agents-update.sh` — runs the stock updater for the other providers
   and this collector for OpenCode Go, writing `opencode-go.json` atomically.
 
